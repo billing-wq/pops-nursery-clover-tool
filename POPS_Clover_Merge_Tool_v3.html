@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>POPS Clover Report Generator v3</title>
+<style>
+  body{font-family:Arial,sans-serif;max-width:1050px;margin:30px auto;padding:0 18px;background:#f7f7f7;color:#222}
+  .card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:20px;margin-bottom:16px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+  h1{margin-top:0}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}.box{border:2px dashed #aaa;border-radius:10px;padding:16px;background:#fafafa}
+  input{width:100%;margin-top:8px}button{font-size:16px;padding:11px 18px;border:0;border-radius:8px;background:#1261a6;color:#fff;cursor:pointer;margin-right:8px;margin-top:6px}button:disabled{background:#999}
+  .ok{color:#0a7f28;font-weight:bold}.bad{color:#b00020;font-weight:bold}.note{font-size:13px;color:#555}
+  pre{white-space:pre-wrap;background:#111;color:#eee;padding:14px;border-radius:8px;max-height:220px;overflow:auto}
+  table{border-collapse:collapse;width:100%;font-size:12px;background:white}th,td{border:1px solid #ddd;padding:6px;vertical-align:top}th{background:#101827;color:#fff;position:sticky;top:0}
+  .preview{max-height:430px;overflow:auto}.refunded td{background:#d9d9d9!important;color:#555}.separator td{background:#111827!important;color:#fff;font-weight:bold;text-align:left}.subtle{color:#666;font-size:12px}
+</style>
+</head>
+<body>
+<div class="card">
+<h1>POPS Clover Report Generator v3</h1>
+<p>Use the regular <b>Orders</b> CSV and the regular <b>LineItemsExport</b> CSV. Do <b>not</b> use <b>LineItemsGroupedByItem</b>.</p>
+<p class="note">v3 keeps the same layout, adds a Paid column, removes Invoice, and puts each line item on its own line.</p>
+</div>
+<div class="card row">
+  <div class="box"><b>1. Orders CSV</b><br><input id="orders" type="file" accept=".csv"></div>
+  <div class="box"><b>2. LineItemsExport CSV</b><br><input id="items" type="file" accept=".csv"></div>
+</div>
+<div class="card">
+  <button id="run">Generate POPS Report</button>
+  <button id="downloadExcel" disabled>Download Excel-Ready File</button>
+  <button id="downloadCSV" disabled>Download CSV</button>
+  <p id="status"></p>
+  <pre id="log"></pre>
+</div>
+<div class="card">
+  <h2>Preview</h2>
+  <div class="preview" id="preview"></div>
+</div>
+<script>
+let finalRows=[];
+const logEl=document.getElementById('log'), statusEl=document.getElementById('status');
+function log(s){logEl.textContent += s + "\n";}
+function norm(s){return String(s||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'');}
+function headerMap(row){const m={}; Object.keys(row).forEach(k=>m[norm(k)]=k); return m;}
+function get(row, names){
+  const map=headerMap(row);
+  for(const n of names){const k=map[norm(n)]; if(k!==undefined) return row[k];}
+  return '';
+}
+function parseCSV(text){
+  text=text.replace(/^\uFEFF/,'');
+  const rows=[]; let row=[], cur='', q=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i], n=text[i+1];
+    if(q){ if(c==='"'&&n==='"'){cur+='"';i++;} else if(c==='"'){q=false;} else cur+=c; }
+    else { if(c==='"')q=true; else if(c===','){row.push(cur);cur='';} else if(c==='\n'){row.push(cur);rows.push(row);row=[];cur='';} else if(c==='\r'){} else cur+=c; }
+  }
+  row.push(cur); rows.push(row);
+  while(rows.length && rows[rows.length-1].every(x=>x==='')) rows.pop();
+  const headers=rows.shift().map(h=>h.trim());
+  return rows.map(r=>{let o={}; headers.forEach((h,i)=>o[h]=r[i]||''); return o;});
+}
+function csvEscape(v){v=String(v??''); return /[",\n]/.test(v)?'"'+v.replace(/"/g,'""')+'"':v;}
+function htmlEscape(v){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function moneyNum(v){let n=parseFloat(String(v||'').replace(/[^0-9.-]/g,'')); return isNaN(n)?0:n;}
+function qtyNum(v){let n=parseFloat(String(v||'').replace(/[^0-9.-]/g,'')); return isNaN(n)?1:n;}
+function formatMoney(n){return '$'+Number(n||0).toFixed(2);}
+function readFile(input){return new Promise((res,rej)=>{const f=input.files[0]; if(!f) return rej('Missing file'); const r=new FileReader(); r.onload=()=>res({name:f.name,text:r.result}); r.onerror=()=>rej(r.error); r.readAsText(f);});}
+function parseDateLoose(v){
+  let s=String(v||'').trim(); if(!s) return 0;
+  let d=new Date(s); if(!isNaN(d)) return d.getTime();
+  // Clover sometimes has 01-Jun-2026 7:30 am
+  d=new Date(s.replace(/-/g,' ')); if(!isNaN(d)) return d.getTime();
+  return 0;
+}
+function tenderGroup(t){
+  const s=String(t||'').toLowerCase();
+  if(s.includes('cash')) return 1;
+  if(s.includes('credit')||s.includes('visa')||s.includes('master')||s.includes('amex')||s.includes('discover')||s.includes('debit')||s.includes('card')) return 2;
+  return 3;
+}
+function tenderGroupName(n){return n===1?'CASH':n===2?'CREDIT / DEBIT CARD':'OTHER / UNKNOWN';}
+function isRefundedText(v){return /true|yes|refund|refunded/i.test(String(v||''));}
+function lineItemInfo(row){
+  const name=get(row,['Item Name','Name','Item','Line Item','Product']);
+  const qty=qtyNum(get(row,['Quantity','Qty','Count']));
+  const price=moneyNum(get(row,['Price','Unit Price','Item Price','Amount','Gross Sales','Revenue','Item Total']));
+  const orderPay=get(row,['Order Pay','Order Payment State','Payment State','Payment Status','Status']);
+  const refunded=get(row,['Refunded','Is Refunded','Refund','Returned']);
+  return {name:name||'(No item name)', qty:qty, price:price, orderPay:orderPay, refunded:isRefundedText(refunded)};
+}
+function detectEmployee(orderRow){
+  return get(orderRow,['Employee','Employee Name','Employee Full Name','Cashier','Server','Created By','Created By Name','Order Employee','Order Employee Name','Staff','Staff Name','Clerk','User']);
+}
+function renderPreview(rows){
+  if(!rows.length){document.getElementById('preview').innerHTML='';return;}
+  const headers=['DATE','LINE ITEMS','TOTAL','PAID','STATUS','EMPLOYEE','ORDER ID','TENDER','DETAILS'];
+  let html='<table><thead><tr>'+headers.map(h=>'<th>'+h+'</th>').join('')+'</tr></thead><tbody>';
+  let currentGroup=null;
+  rows.slice(0,80).forEach(r=>{
+    if(r.__group!==currentGroup){currentGroup=r.__group; html+=`<tr class="separator"><td colspan="${headers.length}">${htmlEscape(tenderGroupName(currentGroup))}</td></tr>`;}
+    const cls=r.__refunded?' class="refunded"':'';
+    html+=`<tr${cls}>`+headers.map(h=>'<td>'+htmlEscape(r[h]).replace(/\n/g,'<br>')+'</td>').join('')+'</tr>';
+  });
+  html+='</tbody></table>'; document.getElementById('preview').innerHTML=html;
+}
+async function generate(){
+  logEl.textContent=''; statusEl.textContent=''; finalRows=[]; document.getElementById('downloadExcel').disabled=true; document.getElementById('downloadCSV').disabled=true;
+  try{
+    const ordFile=await readFile(document.getElementById('orders'));
+    const itemFile=await readFile(document.getElementById('items'));
+    const orders=parseCSV(ordFile.text); const items=parseCSV(itemFile.text);
+    log(`Orders file: ${ordFile.name} (${orders.length} rows)`);
+    log(`Line items file: ${itemFile.name} (${items.length} rows)`);
+    if(!orders.length || !items.length) throw new Error('One of the files has no rows.');
+    const itemsByOrder={};
+    items.forEach(r=>{
+      const oid=get(r,['Order ID','Order Id','Order Number','Order']);
+      if(!oid) return;
+      const item=lineItemInfo(r); const key=item.name+'||'+item.price;
+      if(!itemsByOrder[oid]) itemsByOrder[oid]={items:{}, status:'', refunded:false};
+      if(!itemsByOrder[oid].items[key]) itemsByOrder[oid].items[key]={name:item.name,qty:0,price:item.price};
+      itemsByOrder[oid].items[key].qty += item.qty;
+      if(item.orderPay && !itemsByOrder[oid].status) itemsByOrder[oid].status=item.orderPay;
+      if(item.refunded) itemsByOrder[oid].refunded=true;
+    });
+    let matched=0, missingEmployee=0;
+    finalRows=orders.map(o=>{
+      const oid=get(o,['Order ID','Order Id','Order Number','Order']);
+      const bucket=itemsByOrder[oid]||{items:{},status:'',refunded:false};
+      const arr=Object.values(bucket.items); if(arr.length) matched++;
+      const lineItems=arr.map(x=>`${x.name}${x.price?` ${formatMoney(x.price)}`:''} x ${x.qty}`).join('\n');
+      const total=get(o,['Order Total','Total','Gross Total','Net Total','Amount']);
+      const tender=get(o,['Tender','Payment Tender','Payment Type','Payment','Card Type','Credit Card Type']);
+      const date=get(o,['Order Date','Date','Created Time','Created At','Time']);
+      const employee=detectEmployee(o); if(!employee) missingEmployee++;
+      const orderRefunded=isRefundedText(get(o,['Refunded','Is Refunded','Refund','Returned','Payment State','State','Status']));
+      const status=bucket.status || get(o,['Order Pay','Payment State','State','Status','Payment Status']) || 'Paid';
+      return {
+        'DATE': date,
+        'LINE ITEMS': lineItems,
+        'TOTAL': total || get(o,['Payment Amount','Paid Amount']),
+        'PAID': bucket.status || get(o,['Order Pay','Order Payment State','Payment State','Payment Status']) || 'Paid',
+        'STATUS': status,
+        'EMPLOYEE': employee,
+        'ORDER ID': oid,
+        'TENDER': tender || get(o,['Payments','Payment Method']),
+        'DETAILS': get(o,['Details','Receipt','Receipt Number']) || `Details/Receipt ${total || ''} ${date || ''}`,
+        __time: parseDateLoose(date),
+        __group: tenderGroup(tender || get(o,['Payments','Payment Method'])),
+        __refunded: bucket.refunded || orderRefunded
+      };
+    });
+    finalRows.sort((a,b)=>(a.__group-b.__group)||(a.__time-b.__time)||String(a['ORDER ID']).localeCompare(String(b['ORDER ID'])));
+    log(`Matched ${matched} of ${orders.length} orders by Order ID.`);
+    if(missingEmployee) log(`Employee blank on ${missingEmployee} order rows. If Clover does not include employee in the Orders CSV, export Orders with the employee/cashier column enabled.`);
+    if(matched===0) throw new Error('No matching Order IDs found. Make sure you used LineItemsExport, not LineItemsGroupedByItem.');
+    statusEl.innerHTML='<span class="ok">Report ready. Download the Excel-ready file for gray refunded rows and separators.</span>';
+    renderPreview(finalRows);
+    document.getElementById('downloadExcel').disabled=false;
+    document.getElementById('downloadCSV').disabled=false;
+  }catch(e){statusEl.innerHTML='<span class="bad">'+htmlEscape(e.message||e)+'</span>'; log('Error: '+(e.message||e));}
+}
+function downloadCSV(){
+  const headers=['DATE','LINE ITEMS','TOTAL','PAID','STATUS','EMPLOYEE','ORDER ID','TENDER','DETAILS'];
+  let lines=[headers.join(',')]; let current=null;
+  finalRows.forEach(r=>{
+    if(r.__group!==current){current=r.__group; lines.push(csvEscape(tenderGroupName(current))+',,,,,,,,');}
+    lines.push(headers.map(h=>csvEscape(r[h])).join(','));
+  });
+  const blob=new Blob([lines.join('\r\n')],{type:'text/csv;charset=utf-8'}); const a=document.createElement('a');
+  const d=new Date().toISOString().slice(0,10); a.href=URL.createObjectURL(blob); a.download=`POPS_Report_${d}.csv`; a.click(); URL.revokeObjectURL(a.href);
+}
+function downloadExcel(){
+  const headers=['DATE','LINE ITEMS','TOTAL','PAID','STATUS','EMPLOYEE','ORDER ID','TENDER','DETAILS'];
+  let table='<table><thead><tr>'+headers.map(h=>`<th>${htmlEscape(h)}</th>`).join('')+'</tr></thead><tbody>';
+  let current=null;
+  finalRows.forEach(r=>{
+    if(r.__group!==current){current=r.__group; table+=`<tr class="separator"><td colspan="${headers.length}">${htmlEscape(tenderGroupName(current))}</td></tr>`;}
+    table+=`<tr class="${r.__refunded?'refunded':''}">`+headers.map(h=>`<td>${htmlEscape(r[h]).replace(/\n/g,'<br>')}</td>`).join('')+'</tr>';
+  });
+  table+='</tbody></table>';
+  const html=`<!doctype html><html><head><meta charset="utf-8"><style>
+    table{border-collapse:collapse;font-family:Arial;font-size:10pt} th{background:#101827;color:white;font-weight:bold} th,td{border:1px solid #999;padding:5px;vertical-align:top} .separator td{background:#101827;color:white;font-weight:bold} .refunded td{background:#d9d9d9;color:#555}
+  </style></head><body>${table}</body></html>`;
+  const blob=new Blob([html],{type:'application/vnd.ms-excel;charset=utf-8'}); const a=document.createElement('a');
+  const d=new Date().toISOString().slice(0,10); a.href=URL.createObjectURL(blob); a.download=`POPS_Report_${d}.xls`; a.click(); URL.revokeObjectURL(a.href);
+}
+document.getElementById('run').addEventListener('click',generate);
+document.getElementById('downloadCSV').addEventListener('click',downloadCSV);
+document.getElementById('downloadExcel').addEventListener('click',downloadExcel);
+</script>
+</body>
+</html>
