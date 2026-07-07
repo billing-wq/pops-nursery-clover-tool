@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>POPS Clover Report Generator v2.1</title>
+  <style>
+    :root{--black:#050505;--border:#b9b9b9;--soft:#f6f7fb;--yellow:#fff3bf;--gray:#dddddd;--green:#e7f7e7;}
+    body{font-family:Arial,Helvetica,sans-serif;margin:0;background:#f4f4f6;color:#111;}
+    .wrap{max-width:1220px;margin:24px auto;padding:0 16px;}
+    .card{background:white;border-radius:14px;box-shadow:0 4px 18px rgba(0,0,0,.12);padding:22px;margin-bottom:18px;}
+    h1{margin:0 0 6px;font-size:26px;}
+    .sub{color:#555;margin-bottom:16px;}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+    label{font-weight:700;display:block;margin-bottom:6px;}
+    input[type=file]{width:100%;padding:12px;border:1px dashed #999;border-radius:10px;background:#fafafa;}
+    button{background:#111;color:white;border:0;border-radius:10px;padding:12px 18px;font-weight:700;cursor:pointer;margin-right:8px;margin-top:14px;}
+    button.secondary{background:#2d6cdf;}
+    button:disabled{opacity:.45;cursor:not-allowed;}
+    .note{font-size:13px;color:#444;line-height:1.35;margin-top:10px;}
+    .status{white-space:pre-wrap;background:#111;color:#eee;border-radius:10px;padding:12px;font-family:Consolas,monospace;font-size:13px;min-height:70px;}
+    .legend{font-size:13px;color:#333;margin:8px 0 12px;}
+    .reportBox{overflow:auto;max-height:70vh;border:1px solid #ccc;background:white;}
+    table.report{border-collapse:collapse;width:100%;font-size:13px;}
+    table.report th{background:#050505;color:white;text-transform:uppercase;border:1px solid #6d6d6d;padding:8px;position:sticky;top:0;z-index:2;}
+    table.report td{border:1px solid var(--border);padding:7px;vertical-align:top;background:white;}
+    table.report tr.full-refund td, table.report tr.credit-row td{background:var(--gray)!important;}
+    table.report tr.partial-refund td{background:var(--yellow)!important;}
+    table.report tr.section td{background:#050505!important;color:white;font-weight:800;text-transform:uppercase;padding:7px 9px;letter-spacing:.4px;}
+    td.money{text-align:right;white-space:nowrap;}
+    td.center{text-align:center;}
+    td.lineitems{min-width:320px;white-space:pre-line;line-height:1.25;}
+    td.date{min-width:120px;}
+    td.details{min-width:190px;white-space:pre-line;}
+    .summary{width:420px;margin-top:18px;border-collapse:collapse;font-size:14px;}
+    .summary th{background:#050505;color:white;text-align:left;padding:8px;border:1px solid #555;}
+    .summary td{padding:8px;border:1px solid #bbb;background:white;}
+    .summary td:last-child{text-align:right;font-weight:700;}
+    .ok{color:#0a7b23;font-weight:700}.warn{color:#a15c00;font-weight:700}.err{color:#b00020;font-weight:700}
+    @media(max-width:800px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>POPS Clover Report Generator</h1>
+    <div class="sub">Version 2.2 — split payments (multi-tender & comma-separated) shown in own section</div>
+    <div class="grid">
+      <div>
+        <label>Orders CSV</label>
+        <input id="ordersFile" type="file" accept=".csv,text/csv" />
+      </div>
+      <div>
+        <label>LineItemsExport CSV</label>
+        <input id="itemsFile" type="file" accept=".csv,text/csv" />
+      </div>
+    </div>
+    <button id="generateBtn">Generate Report</button>
+    <button id="downloadBtn" class="secondary" disabled>Download Excel-Ready File</button>
+    <div class="note"><b>Use:</b> Orders export + <b>LineItemsExport</b>. Do not use LineItemsGroupedByItem. Discounts are summed from LineItemsExport → <b>Total Discount</b> by Order ID.</div>
+  </div>
+
+  <div class="card">
+    <div class="status" id="status">Ready. Upload both CSV files.</div>
+  </div>
+
+  <div class="card" id="resultCard" style="display:none">
+    <h2 style="margin-top:0">Generated Report</h2>
+    <div class="legend">Colors: gray = full refund / credit, yellow = partial refund. Sections: Cash → Card → <b>Split Payments</b> → Credits/Refunds.</div>
+    <div class="reportBox" id="reportBox"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+let lastReportHtml = '';
+let lastFileName = 'POPS_Report.xls';
+
+const $ = id => document.getElementById(id);
+const monthMap = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+
+function log(msg){ $('status').textContent = msg; }
+
+function parseCSV(text){
+  text = text.replace(/^\uFEFF/, '');
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i], n = text[i+1];
+    if(inQuotes){
+      if(c === '"' && n === '"'){ field += '"'; i++; }
+      else if(c === '"'){ inQuotes = false; }
+      else { field += c; }
+    } else {
+      if(c === '"'){ inQuotes = true; }
+      else if(c === ','){ row.push(field); field = ''; }
+      else if(c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+      else if(c === '\r') { /* ignore */ }
+      else { field += c; }
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  if(!rows.length) return [];
+  const headers = rows[0].map(h => h.trim());
+  return rows.slice(1).filter(r => r.some(v => String(v||'').trim() !== '')).map(r => {
+    const obj = {};
+    headers.forEach((h, idx) => obj[h] = (r[idx] ?? '').trim());
+    return obj;
+  });
+}
+
+function get(row, names){
+  if(!row) return '';
+  for(const name of names){ if(Object.prototype.hasOwnProperty.call(row, name)) return row[name]; }
+  const wanted = names.map(n => n.toLowerCase().replace(/\s+/g,' ').trim());
+  for(const key of Object.keys(row)){
+    const k = key.toLowerCase().replace(/\s+/g,' ').trim();
+    if(wanted.includes(k)) return row[key];
+  }
+  return '';
+}
+
+function moneyToCents(value){
+  if(value === null || value === undefined) return 0;
+  let s = String(value).trim();
+  if(!s) return 0;
+  let negative = false;
+  if(/^\(.*\)$/.test(s)){ negative = true; s = s.slice(1,-1); }
+  s = s.replace(/[$,\s]/g,'');
+  if(s.startsWith('-.')) s = '-0' + s.slice(1);
+  if(s.startsWith('.')) s = '0' + s;
+  if(s === '-' || s === '') return 0;
+  let n = Number(s);
+  if(!Number.isFinite(n)) return 0;
+  let cents = Math.round(n * 100);
+  if(negative && cents > 0) cents = -cents;
+  return cents;
+}
+
+function formatMoney(cents){
+  cents = Number(cents) || 0;
+  const sign = cents < 0 ? '-' : '';
+  const abs = Math.abs(cents);
+  return sign + '$' + Math.floor(abs/100).toLocaleString('en-US') + '.' + String(abs%100).padStart(2,'0');
+}
+
+function escapeHtml(s){
+  return String(s ?? '').replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+}
+
+function parseCloverDate(s){
+  s = String(s || '').trim();
+  const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{1,2}):(\d{2})\s+([AP]M)/i);
+  if(!m) {
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? new Date(0) : d;
+  }
+  let [, dd, mon, yyyy, hh, min, ampm] = m;
+  let hour = parseInt(hh,10);
+  if(ampm.toUpperCase() === 'PM' && hour !== 12) hour += 12;
+  if(ampm.toUpperCase() === 'AM' && hour === 12) hour = 0;
+  return new Date(parseInt(yyyy,10), monthMap[mon.toLowerCase()], parseInt(dd,10), hour, parseInt(min,10));
+}
+
+function dateForFile(d){
+  if(!d || isNaN(d.getTime())) return new Date().toISOString().slice(0,10);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+function normalizeTender(tender){
+  tender = String(tender || '').trim();
+  return tender || '';
+}
+
+function tenderCategory(tender){
+  const t = String(tender || '').toLowerCase();
+  if(t.includes('cash')) return 'Cash';
+  if(t.includes('visa')) return 'Visa';
+  if(t.includes('mastercard') || t.includes('master card')) return 'Mastercard';
+  if(t.includes('amex') || t.includes('american')) return 'Amex';
+  if(t.includes('discover')) return 'Discover';
+  if(t.includes('debit')) return 'Debit Card';
+  if(t.includes('credit') || t.includes('card')) return 'Credit Card';
+  return String(tender || 'Other').trim() || 'Other';
+}
+
+function buildTenderSummary(orderRows){
+  const payments = new Map();
+  for(const r of orderRows){
+    const rawTender = String(get(r, ['Tender']) || '');
+    // Detect comma-separated tenders on a single row (e.g. "Debit Card, Credit Card")
+    const tenderParts = rawTender.split(',').map(t => t.trim()).filter(Boolean);
+    if(tenderParts.length > 1){
+      // Split payment on a single row — distribute total evenly (no per-tender breakdown available)
+      const totalCents = moneyToCents(get(r, ['Order Total']));
+      const share = Math.round(totalCents / tenderParts.length);
+      tenderParts.forEach((t, i) => {
+        const cat = tenderCategory(t);
+        // Give any rounding remainder to the last part
+        const amount = i === tenderParts.length - 1 ? totalCents - share * (tenderParts.length - 1) : share;
+        payments.set(cat, (payments.get(cat) || 0) + amount);
+      });
+    } else {
+      const tender = tenderCategory(rawTender);
+      let paymentCents = moneyToCents(get(r, ['Payment']));
+      if(paymentCents <= 0) paymentCents = moneyToCents(get(r, ['Order Total']));
+      if(paymentCents > 0){
+        payments.set(tender, (payments.get(tender) || 0) + paymentCents);
+      }
+    }
+  }
+  const parts = [...payments.entries()].map(([name, cents]) => `${name} ${formatMoney(cents)}`);
+  return {
+    tenderText: parts.length ? parts.join(' + ') : normalizeTender(get(orderRows[0], ['Tender'])),
+    isSplit: parts.length > 1
+  };
+}
+
+function sectionFor(row){
+  if(row.isSplitPayment) return 'SPLIT PAYMENTS';
+  const tender = String(row.tender || '').toLowerCase();
+  if((row.totalCents <= 0 && row.refundAmountCents < 0) || row.isCredit) return 'CREDITS / REFUNDS';
+  if(tender.includes('cash')) return 'CASH';
+  if(tender.includes('credit') || tender.includes('debit') || tender.includes('card') || tender.includes('visa') || tender.includes('mastercard') || tender.includes('amex')) return 'CREDIT / DEBIT CARD';
+  return 'CREDIT / DEBIT CARD';
+}
+function sectionRank(sec){ return sec === 'CASH' ? 1 : sec === 'CREDIT / DEBIT CARD' ? 2 : sec === 'SPLIT PAYMENTS' ? 3 : 4; }
+
+function buildLineItems(items){
+  const groups = new Map();
+  for(const it of items){
+    const name = get(it, ['Item Name']) || 'Item';
+    const unitCents = moneyToCents(get(it, ['Item Revenue','Total Revenue','Item Total']));
+    let qty = Number(get(it, ['Per Unit Quantity']));
+    if(!Number.isFinite(qty) || qty <= 0) qty = 1;
+    const key = name + '||' + unitCents;
+    if(!groups.has(key)) groups.set(key, {name, unitCents, qty:0});
+    groups.get(key).qty += qty;
+  }
+  return [...groups.values()].map(g => {
+    const q = Math.round(g.qty * 1000) / 1000;
+    const qText = Number.isInteger(q) ? String(q) : String(q);
+    return `${g.name} ${formatMoney(g.unitCents)} x ${qText}`;
+  }).join('\n');
+}
+
+function readFile(file){
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result || ''));
+    fr.onerror = reject;
+    fr.readAsText(file);
+  });
+}
+
+function makeRowHtml(cells, cls){
+  return `<tr class="${cls || ''}">` + cells.map(c => `<td class="${c.cls||''}">${c.html ?? escapeHtml(c.text ?? '')}</td>`).join('') + '</tr>';
+}
+
+function generateReport(orders, lineItems){
+  const itemsByOrder = new Map();
+  const discountsByOrder = new Map();
+  for(const it of lineItems){
+    const oid = get(it, ['Order ID']);
+    if(!oid) continue;
+    if(!itemsByOrder.has(oid)) itemsByOrder.set(oid, []);
+    itemsByOrder.get(oid).push(it);
+    const disc = moneyToCents(get(it, ['Total Discount']));
+    discountsByOrder.set(oid, (discountsByOrder.get(oid) || 0) + disc);
+  }
+
+  const orderIds = new Set();
+  const ordersById = new Map();
+  for(const order of orders){
+    const oid = get(order, ['Order ID']);
+    if(!oid) continue;
+    if(!ordersById.has(oid)) ordersById.set(oid, []);
+    ordersById.get(oid).push(order);
+  }
+
+  function buildReportRow(order, fallbackItems, orderRows){
+    const oid = get(order, ['Order ID']) || get(fallbackItems[0], ['Order ID']);
+    orderIds.add(oid);
+    const items = itemsByOrder.get(oid) || fallbackItems || [];
+    const dateText = get(order, ['Order Date']) || get(items[0], ['Line Item Date']);
+    const d = parseCloverDate(dateText);
+    let totalCents = moneyToCents(get(order, ['Order Total']));
+    if(!get(order, ['Order Total']) && items.length){
+      totalCents = items.reduce((sum, it) => sum + moneyToCents(get(it, ['Item Total with Tax/Fee Amount','Item Total','Total Revenue'])), 0);
+    }
+
+    const allOrderRows = orderRows && orderRows.length ? orderRows : [order];
+    const positiveTotal = allOrderRows.map(o => moneyToCents(get(o, ['Order Total']))).filter(v => v > 0).reduce((a,b)=>a+b,0);
+    const negativeTotal = allOrderRows.map(o => moneyToCents(get(o, ['Order Total']))).filter(v => v < 0).reduce((a,b)=>a+b,0);
+    if(positiveTotal > 0) totalCents = positiveTotal;
+
+    const refundsTotal = allOrderRows.reduce((sum, o) => sum + moneyToCents(get(o, ['Refunds Total'])) + moneyToCents(get(o, ['Manual Refunds Total'])), 0);
+    let refundAmountCents = 0;
+    if(refundsTotal !== 0) refundAmountCents = -Math.abs(refundsTotal);
+    else if(negativeTotal < 0) refundAmountCents = negativeTotal;
+    else if(totalCents < 0) refundAmountCents = totalCents;
+
+    const rawStatus = get(order, ['Order Payment State']) || get(items[0], ['Order Payment State']) || '';
+    const statusLower = String(rawStatus).toLowerCase();
+    const isCredit = totalCents < 0 || statusLower.includes('credit');
+    const isFullRefund = refundAmountCents < 0 && positiveTotal <= 0 && !isCredit;
+    const isPartialRefund = refundAmountCents < 0 && positiveTotal > 0;
+    const status = isCredit ? 'Credited' : isFullRefund ? 'Refunded' : isPartialRefund ? 'Paid / Refunded' : (rawStatus || 'Paid');
+
+    const discountAmountCents = Math.abs(discountsByOrder.get(oid) || 0);
+    const tenderInfo = buildTenderSummary(allOrderRows);
+    return {
+      date: dateText, dateObj: d,
+      lineItems: buildLineItems(items),
+      totalCents,
+      paid: rawStatus || get(order, ['Order Payment State']) || '',
+      tender: tenderInfo.tenderText,
+      isSplitPayment: tenderInfo.isSplit,
+      invoice: '',
+      refundAmountCents,
+      discountAmountCents,
+      status,
+      orderId: oid,
+      employee: get(order, ['Order Employee Name']) || get(items[0], ['Order Employee Name']) || '',
+      details: `Details/Receipt ${formatMoney(totalCents)}\n${dateText}`,
+      isFullRefund, isPartialRefund, isCredit
+    };
+  }
+
+  const rows = [...ordersById.entries()].map(([oid, orderRows]) => {
+    const mainOrder = orderRows.find(o => moneyToCents(get(o, ['Order Total'])) > 0) || orderRows[0];
+    return buildReportRow(mainOrder, [], orderRows);
+  });
+
+  // Some Clover credits/manual refunds appear only in LineItemsExport, not in Orders.
+  for(const [oid, items] of itemsByOrder.entries()){
+    if(orderIds.has(oid)) continue;
+    const missingTotal = items.reduce((sum, it) => sum + moneyToCents(get(it, ['Item Total with Tax/Fee Amount','Item Total','Total Revenue'])), 0);
+    const missingStatus = String(get(items[0], ['Order Payment State']) || '').toLowerCase();
+    if(missingTotal < 0 || missingStatus.includes('credit') || missingStatus.includes('refund')){
+      rows.push(buildReportRow({'Order ID': oid}, items, []));
+    }
+  }
+
+  rows.forEach(r => r.section = sectionFor(r));
+  rows.sort((a,b) => sectionRank(a.section)-sectionRank(b.section) || a.dateObj-b.dateObj || a.orderId.localeCompare(b.orderId));
+
+  const headers = ['DATE','LINE ITEMS','TOTAL','PAID','TENDER','INVOICE','REFUND AMOUNT','DISCOUNT AMOUNT','STATUS','ORDER ID','EMPLOYEE','DETAILS'];
+  let table = '<table class="report"><thead><tr>' + headers.map(h=>`<th>${h}</th>`).join('') + '</tr></thead><tbody>';
+  let current = '';
+  const summary = {cash:0, card:0, split:0, credits:0, refunds:0, discounts:0, orders: rows.length, cashCount:0, cardCount:0, splitCount:0, refundCount:0};
+
+  for(const r of rows){
+    if(r.section !== current){
+      current = r.section;
+      table += `<tr class="section"><td colspan="12">${escapeHtml(current)}</td></tr>`;
+    }
+    const cls = r.isCredit ? 'credit-row' : r.isFullRefund ? 'full-refund' : r.isPartialRefund ? 'partial-refund' : '';
+    table += makeRowHtml([
+      {text:r.date, cls:'date'},
+      {html:escapeHtml(r.lineItems).replace(/\n/g,'<br>'), cls:'lineitems'},
+      {text:formatMoney(r.totalCents), cls:'money'},
+      {text:r.paid, cls:'center'},
+      {text:r.tender},
+      {text:r.invoice},
+      {text:formatMoney(r.refundAmountCents), cls:'money'},
+      {text:formatMoney(r.discountAmountCents), cls:'money'},
+      {text:r.status, cls:'center'},
+      {text:r.orderId},
+      {text:r.employee},
+      {html:escapeHtml(r.details).replace(/\n/g,'<br>'), cls:'details'}
+    ], cls);
+
+    if(r.section === 'CASH'){ summary.cash += r.totalCents; summary.cashCount++; }
+    else if(r.section === 'CREDIT / DEBIT CARD'){ summary.card += r.totalCents; summary.cardCount++; }
+    else if(r.section === 'SPLIT PAYMENTS'){ summary.split += r.totalCents; summary.splitCount++; }
+    else { summary.credits += r.totalCents; }
+    if(r.refundAmountCents < 0){ summary.refunds += r.refundAmountCents; summary.refundCount++; }
+    if(r.discountAmountCents > 0){ summary.discounts -= r.discountAmountCents; }
+  }
+  table += '</tbody></table>';
+
+  const net = rows.reduce((sum,r)=>sum+r.totalCents,0);
+  const avg = rows.length ? Math.round(net / rows.length) : 0;
+  const summaryHtml = `<table class="summary">
+    <tr><th colspan="2">DAILY SUMMARY</th></tr>
+    <tr><td>Cash Sales</td><td>${formatMoney(summary.cash)}</td></tr>
+    <tr><td>Card Sales</td><td>${formatMoney(summary.card)}</td></tr>
+    <tr><td>Split Payment Sales</td><td>${formatMoney(summary.split)}</td></tr>
+    <tr><td>Credits / Refund Transactions</td><td>${formatMoney(summary.credits)}</td></tr>
+    <tr><td>Refunds</td><td>${formatMoney(summary.refunds)}</td></tr>
+    <tr><td>Discounts</td><td>${formatMoney(summary.discounts)}</td></tr>
+    <tr><td><b>Net Sales</b></td><td><b>${formatMoney(net)}</b></td></tr>
+    <tr><td>Orders</td><td>${summary.orders}</td></tr>
+    <tr><td>Cash Orders</td><td>${summary.cashCount}</td></tr>
+    <tr><td>Card Orders</td><td>${summary.cardCount}</td></tr>
+    <tr><td>Split Payment Orders</td><td>${summary.splitCount}</td></tr>
+    <tr><td>Refund Count</td><td>${summary.refundCount}</td></tr>
+    <tr><td>Average Ticket</td><td>${formatMoney(avg)}</td></tr>
+  </table>`;
+
+  const firstDate = rows.find(r => r.dateObj && !isNaN(r.dateObj.getTime()))?.dateObj || new Date();
+  lastFileName = `POPS_Report_${dateForFile(firstDate)}.xls`;
+  return {html: table + summaryHtml, matched: rows.filter(r => (itemsByOrder.get(r.orderId)||[]).length).length, totalOrders: orders.length, totalItems: lineItems.length};
+}
+
+function excelDocument(innerHtml){
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+    body{font-family:Arial,Helvetica,sans-serif;}
+    table.report{border-collapse:collapse;width:100%;font-size:11pt;}
+    table.report th{background:#050505;color:#ffffff;text-transform:uppercase;border:1px solid #666;padding:6px;font-weight:bold;}
+    table.report td{border:1px solid #999;padding:6px;vertical-align:top;}
+    table.report tr.section td{background:#050505;color:#ffffff;font-weight:bold;text-transform:uppercase;}
+    table.report tr.full-refund td, table.report tr.credit-row td{background:#dddddd;}
+    table.report tr.partial-refund td{background:#fff3bf;}
+    td.money{text-align:right;white-space:nowrap;} td.center{text-align:center;} td.lineitems{white-space:normal;} td.details{white-space:normal;}
+    .summary{width:420px;margin-top:18px;border-collapse:collapse;font-size:11pt;}
+    .summary th{background:#050505;color:#ffffff;text-align:left;padding:6px;border:1px solid #555;}
+    .summary td{padding:6px;border:1px solid #999;} .summary td:last-child{text-align:right;font-weight:bold;}
+  </style></head><body>${innerHtml}</body></html>`;
+}
+
+$('generateBtn').addEventListener('click', async () => {
+  try{
+    const ordersFile = $('ordersFile').files[0];
+    const itemsFile = $('itemsFile').files[0];
+    if(!ordersFile || !itemsFile){ alert('Please choose both CSV files.'); return; }
+    log('Reading files...');
+    const [aText,bText] = await Promise.all([readFile(ordersFile), readFile(itemsFile)]);
+    let a = parseCSV(aText), b = parseCSV(bText);
+    const aKeys = a.length ? Object.keys(a[0]).map(k => k.toLowerCase()) : [];
+    const bKeys = b.length ? Object.keys(b[0]).map(k => k.toLowerCase()) : [];
+    const aHasOrderDate = aKeys.includes('order date');
+    const bHasOrderDate = bKeys.includes('order date');
+    const aHasLineDate = aKeys.includes('line item date');
+    const bHasLineDate = bKeys.includes('line item date');
+    let orders = a, lineItems = b;
+    if(aHasLineDate && bHasOrderDate){ orders = b; lineItems = a; }
+    else if(!aHasOrderDate && bHasLineDate){ orders = b; lineItems = a; }
+    if(!orders.length || !lineItems.length) throw new Error('One of the CSV files appears empty.');
+    const result = generateReport(orders, lineItems);
+    $('reportBox').innerHTML = result.html;
+    $('resultCard').style.display = 'block';
+    $('downloadBtn').disabled = false;
+    lastReportHtml = result.html;
+    log(`Generated successfully.\nOrders imported: ${result.totalOrders}\nLine items imported: ${result.totalItems}\nOrders matched with line items: ${result.matched}\nDownload file: ${lastFileName}`);
+  } catch(err){
+    console.error(err);
+    log('ERROR: ' + err.message);
+    alert('Could not generate report: ' + err.message);
+  }
+});
+
+$('downloadBtn').addEventListener('click', () => {
+  if(!lastReportHtml) return;
+  const blob = new Blob([excelDocument(lastReportHtml)], {type:'application/vnd.ms-excel;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = lastFileName;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+</script>
+</body>
+</html>
